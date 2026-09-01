@@ -42,6 +42,8 @@ function now() {
 function buildThread(thread) {
   return {
     id: thread.id,
+    forkedFromId: thread.forkedFromId || null,
+    parentThreadId: thread.parentThreadId || null,
     preview: thread.preview || "",
     ephemeral: Boolean(thread.ephemeral),
     modelProvider: "openai",
@@ -116,9 +118,11 @@ function send(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
 
-function nextThread(state, cwd, ephemeral) {
+function nextThread(state, cwd, ephemeral, { forkedFromId = null, parentThreadId = null } = {}) {
   const thread = {
     id: "thr_" + state.nextThreadId++,
+    forkedFromId,
+    parentThreadId,
     cwd: cwd || process.cwd(),
     name: null,
     preview: "",
@@ -316,7 +320,7 @@ rl.on("line", (line) => {
         state.subscriptions = [...new Set([...(state.subscriptions || []), thread.id])];
         saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
-        send({ method: "thread/started", params: { thread: { id: thread.id } } });
+        send({ method: "thread/started", params: { thread: buildThread(thread) } });
         break;
       }
 
@@ -343,6 +347,12 @@ rl.on("line", (line) => {
       }
 
       case "thread/resume": {
+        if (BEHAVIOR === "overlapping-resume" && message.params.persistFullHistory === true) {
+          setTimeout(() => {
+            send({ id: message.id, error: { code: -32000, message: "forced delayed resume failure" } });
+          }, 100);
+          break;
+        }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
@@ -356,11 +366,11 @@ rl.on("line", (line) => {
 
       case "thread/fork": {
         const sourceThread = ensureThread(state, message.params.threadId);
-        const thread = nextThread(state, sourceThread.cwd, message.params.ephemeral);
+        const thread = nextThread(state, sourceThread.cwd, message.params.ephemeral, { forkedFromId: sourceThread.id });
         state.subscriptions = [...new Set([...(state.subscriptions || []), thread.id])];
         saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread) } });
-        send({ method: "thread/started", params: { thread: { id: thread.id } } });
+        send({ method: "thread/started", params: { thread: buildThread(thread) } });
         break;
       }
 
@@ -369,7 +379,10 @@ rl.on("line", (line) => {
         const wasSubscribed = subscriptions.includes(message.params.threadId);
         const wasLoaded = state.threads.some((thread) => thread.id === message.params.threadId);
         state.unsubscribeRequests = [...(state.unsubscribeRequests || []), message.params.threadId];
-        if (BEHAVIOR === "unsubscribe-fails") {
+        if (
+          BEHAVIOR === "unsubscribe-fails" ||
+          (BEHAVIOR === "unsubscribe-fails-once" && state.unsubscribeRequests.length === 1)
+        ) {
           saveState(state);
           send({ id: message.id, error: { code: -32000, message: "thread unsubscribe failed" } });
           break;
@@ -501,7 +514,7 @@ rl.on("line", (line) => {
         if (BEHAVIOR === "with-delayed-subagent") {
           setTimeout(() => {
             const delayedState = loadState();
-            const subThread = nextThread(delayedState, thread.cwd, true);
+            const subThread = nextThread(delayedState, thread.cwd, true, { parentThreadId: thread.id });
             const subThreadRecord = ensureThread(delayedState, subThread.id);
             subThreadRecord.name = "delayed-design-challenger";
             delayedState.subscriptions = [...new Set([...(delayedState.subscriptions || []), subThread.id])];
@@ -516,17 +529,20 @@ rl.on("line", (line) => {
 
         if (
           BEHAVIOR === "with-subagent" ||
+          BEHAVIOR === "with-receiver-only-subagent" ||
           BEHAVIOR === "with-late-subagent-message" ||
           BEHAVIOR === "with-subagent-no-main-turn-completed"
         ) {
-          const subThread = nextThread(state, thread.cwd, true);
+          const subThread = nextThread(state, thread.cwd, true, { parentThreadId: thread.id });
           const subThreadRecord = ensureThread(state, subThread.id);
           subThreadRecord.name = "design-challenger";
           state.subscriptions = [...new Set([...(state.subscriptions || []), subThread.id])];
           saveState(state);
           const subTurnId = nextTurnId(state);
 
-          send({ method: "thread/started", params: { thread: { ...buildThread(subThreadRecord), name: "design-challenger", agentNickname: "design-challenger" } } });
+          if (BEHAVIOR !== "with-receiver-only-subagent") {
+            send({ method: "thread/started", params: { thread: { ...buildThread(subThreadRecord), name: "design-challenger", agentNickname: "design-challenger" } } });
+          }
           send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
           send({
             method: "item/started",

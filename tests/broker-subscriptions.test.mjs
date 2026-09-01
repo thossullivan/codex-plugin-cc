@@ -16,6 +16,20 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitWithTimeout(promise, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function waitFor(predicate, { timeoutMs = 10000, intervalMs = 25 } = {}) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -43,6 +57,7 @@ function startBroker(behavior = "review-ok") {
   const socketPath = path.join(sessionDir, "broker.sock");
   const pidFile = path.join(sessionDir, "broker.pid");
   const statePath = path.join(binDir, "fake-codex-state.json");
+  const tempDirs = [binDir, sessionDir, cwd];
 
   const child = spawn(
     process.execPath,
@@ -58,15 +73,21 @@ function startBroker(behavior = "review-ok") {
   });
 
   async function stop() {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      await exited;
-      return;
-    }
-    child.kill("SIGTERM");
-    const result = await Promise.race([exited, delay(5000).then(() => null)]);
-    if (!result) {
-      child.kill("SIGKILL");
-      await exited;
+    try {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        await exited;
+        return;
+      }
+      child.kill("SIGTERM");
+      const result = await waitWithTimeout(exited, 5000);
+      if (!result) {
+        child.kill("SIGKILL");
+        await exited;
+      }
+    } finally {
+      for (const tempDir of tempDirs) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
     }
   }
 
@@ -97,8 +118,7 @@ async function connectClient(socketPath) {
   function notifyWaiters(message) {
     for (const waiter of [...notificationWaiters]) {
       if (waiter.predicate(message)) {
-        notificationWaiters.delete(waiter);
-        waiter.resolve(message);
+        waiter.settle(message);
       }
     }
   }
@@ -152,10 +172,19 @@ async function connectClient(socketPath) {
     if (existing) {
       return existing;
     }
-    const notification = new Promise((resolve) => {
-      notificationWaiters.add({ predicate, resolve });
+    return new Promise((resolve) => {
+      let timer;
+      const waiter = {
+        predicate,
+        settle(message) {
+          clearTimeout(timer);
+          notificationWaiters.delete(waiter);
+          resolve(message);
+        }
+      };
+      timer = setTimeout(() => waiter.settle(null), timeoutMs);
+      notificationWaiters.add(waiter);
     });
-    return Promise.race([notification, delay(timeoutMs).then(() => null)]);
   }
 
   await request("initialize", {});
@@ -296,6 +325,30 @@ test("broker unsubscribes auto-subscribed subagent threads", async (t) => {
   assert.deepEqual(readState(broker.statePath).subscriptions, []);
 });
 
+test("broker tracks subagent subscriptions from collaboration items", async (t) => {
+  const broker = startBroker("with-receiver-only-subagent");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  const client = await connectClient(broker.socketPath);
+  const threadId = (await client.request("thread/start", { cwd: process.cwd(), ephemeral: true })).thread.id;
+  await client.request("turn/start", {
+    threadId,
+    input: [{ type: "text", text: "delegate without a thread-started notification" }]
+  });
+  const completed = await client.waitForNotification(
+    (message) => message.method === "turn/completed" && message.params?.threadId === threadId
+  );
+  assert.ok(completed, "task never completed");
+
+  const subagentThread = readState(broker.statePath).threads.find((thread) => thread.name === "design-challenger");
+  assert.ok(subagentThread, "subagent thread was not created");
+
+  await client.end();
+  await waitForUnsubscribes(broker.statePath, [threadId, subagentThread.id]);
+  assert.deepEqual(readState(broker.statePath).subscriptions, []);
+});
+
 test("broker unsubscribes a child thread created after its client disconnects", async (t) => {
   const broker = startBroker("with-delayed-subagent");
   t.after(() => broker.stop());
@@ -319,6 +372,80 @@ test("broker unsubscribes a child thread created after its client disconnects", 
 
   await waitForUnsubscribes(broker.statePath, [threadId, childThread.id]);
   assert.deepEqual(readState(broker.statePath).subscriptions, []);
+});
+
+test("broker does not assign a delayed child thread to an unrelated active client", async (t) => {
+  const broker = startBroker("with-delayed-subagent");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  const firstClient = await connectClient(broker.socketPath);
+  const firstThreadId = (
+    await firstClient.request("thread/start", { cwd: process.cwd(), ephemeral: true })
+  ).thread.id;
+  await firstClient.request("turn/start", {
+    threadId: firstThreadId,
+    input: [{ type: "text", text: "create a delayed child" }]
+  });
+  firstClient.destroy();
+
+  const secondClient = await connectClient(broker.socketPath);
+  const secondThreadId = (
+    await secondClient.request("thread/start", { cwd: process.cwd(), ephemeral: true })
+  ).thread.id;
+  await secondClient.request("turn/start", {
+    threadId: secondThreadId,
+    input: [{ type: "text", text: "remain active while the first child arrives" }]
+  });
+
+  const childrenCreated = await waitFor(
+    () => readState(broker.statePath)?.threads.filter((thread) => thread.parentThreadId).length === 2
+  );
+  assert.equal(childrenCreated, true, "delayed child threads were not created");
+
+  const state = readState(broker.statePath);
+  const firstChild = state.threads.find((thread) => thread.parentThreadId === firstThreadId);
+  const secondChild = state.threads.find((thread) => thread.parentThreadId === secondThreadId);
+  assert.ok(firstChild, "the first client's child thread was not recorded");
+  assert.ok(secondChild, "the second client's child thread was not recorded");
+
+  const firstReleased = await waitFor(() => {
+    const requests = readState(broker.statePath)?.unsubscribeRequests ?? [];
+    return requests.includes(firstThreadId) && requests.includes(firstChild.id);
+  });
+  assert.equal(firstReleased, true, "the disconnected client's subscriptions were not released");
+  const requestsBeforeSecondClientCloses = readState(broker.statePath).unsubscribeRequests;
+  assert.equal(requestsBeforeSecondClientCloses.includes(secondThreadId), false);
+  assert.equal(requestsBeforeSecondClientCloses.includes(secondChild.id), false);
+
+  await secondClient.end();
+  await waitForUnsubscribes(broker.statePath, [firstThreadId, firstChild.id, secondThreadId, secondChild.id]);
+  assert.deepEqual(readState(broker.statePath).subscriptions, []);
+});
+
+test("broker serializes subscription requests from one downstream client", async (t) => {
+  const broker = startBroker("overlapping-resume");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  const firstClient = await connectClient(broker.socketPath);
+  const threadId = (await firstClient.request("thread/start", { cwd: process.cwd(), ephemeral: false })).thread.id;
+  const secondClient = await connectClient(broker.socketPath);
+  const results = await Promise.allSettled([
+    secondClient.request("thread/resume", { threadId, persistFullHistory: true }),
+    secondClient.request("thread/resume", { threadId })
+  ]);
+  assert.equal(results[0].status, "rejected");
+  assert.match(results[0].reason.message, /forced delayed resume failure/);
+  assert.equal(results[1].status, "fulfilled");
+
+  await firstClient.end();
+  await delay(250);
+  assert.deepEqual(readState(broker.statePath).unsubscribeRequests, []);
+  assert.deepEqual(readState(broker.statePath).subscriptions, [threadId]);
+
+  await secondClient.end();
+  await waitForUnsubscribes(broker.statePath, [threadId]);
 });
 
 test("broker keeps shared upstream subscriptions when one client explicitly unsubscribes", async (t) => {
@@ -377,4 +504,22 @@ test("broker logs upstream unsubscribe failures", async (t) => {
   );
   assert.equal(warningObserved, true, "unsubscribe failure was not logged");
   assert.deepEqual(readState(broker.statePath).subscriptions, [threadId]);
+});
+
+test("broker retries a transient upstream unsubscribe failure", async (t) => {
+  const broker = startBroker("unsubscribe-fails-once");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  const client = await connectClient(broker.socketPath);
+  const threadId = (await client.request("thread/start", { cwd: process.cwd(), ephemeral: true })).thread.id;
+  await client.end();
+
+  const retried = await waitFor(() => {
+    const state = readState(broker.statePath);
+    return state?.unsubscribeRequests?.length === 2 && state.subscriptions.length === 0;
+  });
+  assert.equal(retried, true, "the failed unsubscribe was not retried");
+  assert.deepEqual(readState(broker.statePath).unsubscribeRequests, [threadId, threadId]);
+  assert.match(broker.stderr(), new RegExp(`Failed to unsubscribe Codex thread ${threadId}`));
 });

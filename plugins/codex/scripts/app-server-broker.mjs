@@ -11,6 +11,7 @@ import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 const SUBSCRIBING_METHODS = new Set(["thread/start", "thread/resume", "thread/fork"]);
+const UNSUBSCRIBE_RETRY_DELAYS_MS = [100, 500, 2000];
 
 function buildSubscriptionThreadIds(method, result) {
   const threadIds = new Set();
@@ -34,23 +35,22 @@ function buildProvisionalSubscriptionThreadIds(method, params) {
   return threadIds;
 }
 
-function buildNotificationSubscriptionThreadIds(message) {
-  const threadIds = new Set();
-  const params = message?.params;
-  if (message?.method === "thread/started" && params?.thread?.id) {
-    threadIds.add(params.thread.id);
+function buildNotificationSubscriptionRelationships(message) {
+  const relationships = [];
+  const thread = message?.method === "thread/started" ? message.params?.thread : null;
+  if (thread?.id && thread?.parentThreadId) {
+    relationships.push({ sourceThreadId: thread.parentThreadId, subscribedThreadId: thread.id });
   }
-  if (params?.threadId) {
-    threadIds.add(params.threadId);
-  }
-  if (Array.isArray(params?.item?.receiverThreadIds)) {
-    for (const threadId of params.item.receiverThreadIds) {
+
+  const item = message?.params?.item;
+  if (item?.type === "collabAgentToolCall" && item?.senderThreadId && Array.isArray(item.receiverThreadIds)) {
+    for (const threadId of item.receiverThreadIds) {
       if (threadId) {
-        threadIds.add(threadId);
+        relationships.push({ sourceThreadId: item.senderThreadId, subscribedThreadId: threadId });
       }
     }
   }
-  return threadIds;
+  return relationships;
 }
 
 function buildStreamThreadIds(method, params, result) {
@@ -117,9 +117,19 @@ async function main() {
   const socketThreadIds = new Map();
   const threadSockets = new Map();
   const pendingUnsubscribes = new Map();
-  const socketUnsubscribingThreadIds = new Map();
+  const unsubscribeRetryTimers = new Map();
+
+  function cancelUnsubscribeRetry(threadId) {
+    const retry = unsubscribeRetryTimers.get(threadId);
+    if (!retry) {
+      return;
+    }
+    clearTimeout(retry.timer);
+    unsubscribeRetryTimers.delete(threadId);
+  }
 
   function addThreadOwner(socket, threadId) {
+    cancelUnsubscribeRetry(threadId);
     let ownedThreadIds = socketThreadIds.get(socket);
     if (!ownedThreadIds) {
       ownedThreadIds = new Set();
@@ -156,22 +166,6 @@ async function main() {
     return true;
   }
 
-  function setSocketThreadUnsubscribing(socket, threadId, isUnsubscribing) {
-    let threadIds = socketUnsubscribingThreadIds.get(socket);
-    if (isUnsubscribing) {
-      if (!threadIds) {
-        threadIds = new Set();
-        socketUnsubscribingThreadIds.set(socket, threadIds);
-      }
-      threadIds.add(threadId);
-      return;
-    }
-    threadIds?.delete(threadId);
-    if (threadIds?.size === 0) {
-      socketUnsubscribingThreadIds.delete(socket);
-    }
-  }
-
   function requestThreadUnsubscribe(threadId) {
     const pending = pendingUnsubscribes.get(threadId);
     if (pending) {
@@ -195,11 +189,35 @@ async function main() {
     return request;
   }
 
-  async function unsubscribeIfUnowned(threadId) {
+  function scheduleUnsubscribeRetry(threadId, retryIndex) {
+    if (
+      retryIndex >= UNSUBSCRIBE_RETRY_DELAYS_MS.length ||
+      unsubscribeRetryTimers.has(threadId) ||
+      threadSockets.has(threadId) ||
+      appClient.closed
+    ) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      unsubscribeRetryTimers.delete(threadId);
+      void unsubscribeIfUnowned(threadId, { retryOnFailure: true, retryIndex: retryIndex + 1 });
+    }, UNSUBSCRIBE_RETRY_DELAYS_MS[retryIndex]);
+    timer.unref?.();
+    unsubscribeRetryTimers.set(threadId, { timer, retryIndex });
+  }
+
+  async function unsubscribeIfUnowned(threadId, { retryOnFailure = false, retryIndex = 0 } = {}) {
     if (threadSockets.has(threadId) || appClient.closed) {
+      cancelUnsubscribeRetry(threadId);
       return null;
     }
-    return requestThreadUnsubscribe(threadId);
+    const outcome = await requestThreadUnsubscribe(threadId);
+    if (outcome.error && retryOnFailure) {
+      scheduleUnsubscribeRetry(threadId, retryIndex);
+    } else if (!outcome.error) {
+      cancelUnsubscribeRetry(threadId);
+    }
+    return outcome;
   }
 
   async function releaseThreadOwners(socket, threadIds = socketThreadIds.get(socket) ?? new Set()) {
@@ -209,32 +227,35 @@ async function main() {
         releasedThreadIds.push(threadId);
       }
     }
-    await Promise.all(releasedThreadIds.map((threadId) => unsubscribeIfUnowned(threadId)));
+    await Promise.all(
+      releasedThreadIds.map((threadId) => unsubscribeIfUnowned(threadId, { retryOnFailure: true }))
+    );
   }
 
-  function trackSubscriptionResults(socket, method, result, provisionalThreadIds) {
+  function trackSubscriptionResults(socket, method, result) {
     for (const threadId of buildSubscriptionThreadIds(method, result)) {
-      if (provisionalThreadIds.has(threadId)) {
-        continue;
-      }
       if (socket.destroyed || !sockets.has(socket)) {
-        void unsubscribeIfUnowned(threadId);
+        void unsubscribeIfUnowned(threadId, { retryOnFailure: true });
         continue;
       }
       addThreadOwner(socket, threadId);
     }
   }
 
-  function trackNotificationSubscriptions(socket, message) {
-    // App-server auto-subscribes its connection to child threads created by subagents.
-    // Attribute those notification-only subscriptions to the active downstream client.
-    for (const threadId of buildNotificationSubscriptionThreadIds(message)) {
-      if (socket && !socket.destroyed && sockets.has(socket)) {
-        if (!socketUnsubscribingThreadIds.get(socket)?.has(threadId)) {
-          addThreadOwner(socket, threadId);
-        }
-      } else {
-        void unsubscribeIfUnowned(threadId);
+  function trackNotificationSubscriptions(message) {
+    // App-server can auto-subscribe its connection to subagent threads. Attribute
+    // each child to the downstream owners of its causal parent, not the client
+    // that happens to be active when a delayed notification arrives.
+    for (const { sourceThreadId, subscribedThreadId } of buildNotificationSubscriptionRelationships(message)) {
+      const sourceOwners = [...(threadSockets.get(sourceThreadId) ?? [])].filter(
+        (socket) => !socket.destroyed && sockets.has(socket)
+      );
+      if (sourceOwners.length === 0) {
+        void unsubscribeIfUnowned(subscribedThreadId, { retryOnFailure: true });
+        continue;
+      }
+      for (const socket of sourceOwners) {
+        addThreadOwner(socket, subscribedThreadId);
       }
     }
   }
@@ -250,16 +271,11 @@ async function main() {
       if (threadSockets.has(threadId)) {
         return { status: "notSubscribed" };
       }
-      setSocketThreadUnsubscribing(socket, threadId, true);
-      try {
-        const outcome = await requestThreadUnsubscribe(threadId);
-        if (outcome.error) {
-          throw outcome.error;
-        }
-        return outcome.result;
-      } finally {
-        setSocketThreadUnsubscribing(socket, threadId, false);
+      const outcome = await unsubscribeIfUnowned(threadId);
+      if (outcome?.error) {
+        throw outcome.error;
       }
+      return outcome?.result ?? { status: "notSubscribed" };
     }
 
     removeThreadOwner(socket, threadId);
@@ -267,19 +283,14 @@ async function main() {
       return { status: "unsubscribed" };
     }
 
-    setSocketThreadUnsubscribing(socket, threadId, true);
-    try {
-      const outcome = await unsubscribeIfUnowned(threadId);
-      if (outcome?.error) {
-        if (!socket.destroyed && sockets.has(socket)) {
-          addThreadOwner(socket, threadId);
-        }
-        throw outcome.error;
+    const outcome = await unsubscribeIfUnowned(threadId);
+    if (outcome?.error) {
+      if (!socket.destroyed && sockets.has(socket)) {
+        addThreadOwner(socket, threadId);
       }
-      return outcome?.result ?? { status: "unsubscribed" };
-    } finally {
-      setSocketThreadUnsubscribing(socket, threadId, false);
+      throw outcome.error;
     }
+    return outcome?.result ?? { status: "unsubscribed" };
   }
 
   function clearSocketOwnership(socket) {
@@ -294,7 +305,7 @@ async function main() {
 
   function routeNotification(message) {
     const target = activeRequestSocket ?? activeStreamSocket;
-    trackNotificationSubscriptions(target, message);
+    trackNotificationSubscriptions(message);
     if (!target) {
       return;
     }
@@ -312,6 +323,10 @@ async function main() {
   }
 
   async function shutdown(server) {
+    for (const { timer } of unsubscribeRetryTimers.values()) {
+      clearTimeout(timer);
+    }
+    unsubscribeRetryTimers.clear();
     for (const socket of sockets) {
       socket.end();
     }
@@ -331,134 +346,140 @@ async function main() {
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
+    let processing = Promise.resolve();
 
-    socket.on("data", async (chunk) => {
+    async function handleLine(line) {
+      if (!line.trim() || socket.destroyed || !sockets.has(socket)) {
+        return;
+      }
+
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        send(socket, {
+          id: null,
+          error: buildJsonRpcError(-32700, `Invalid JSON: ${error.message}`)
+        });
+        return;
+      }
+
+      if (message.id !== undefined && message.method === "initialize") {
+        send(socket, {
+          id: message.id,
+          result: {
+            userAgent: "codex-companion-broker"
+          }
+        });
+        return;
+      }
+
+      if (message.method === "initialized" && message.id === undefined) {
+        return;
+      }
+
+      if (message.id !== undefined && message.method === "broker/shutdown") {
+        send(socket, { id: message.id, result: {} });
+        await shutdown(server);
+        process.exit(0);
+      }
+
+      if (message.id === undefined) {
+        return;
+      }
+
+      const allowInterruptDuringActiveStream =
+        isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
+
+      if (
+        ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
+        !allowInterruptDuringActiveStream
+      ) {
+        send(socket, {
+          id: message.id,
+          error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Shared Codex broker is busy.")
+        });
+        return;
+      }
+
+      if (allowInterruptDuringActiveStream) {
+        try {
+          const result = await appClient.request(message.method, message.params ?? {});
+          send(socket, { id: message.id, result });
+        } catch (error) {
+          send(socket, {
+            id: message.id,
+            error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
+          });
+        }
+        return;
+      }
+
+      const isStreaming = STREAMING_METHODS.has(message.method);
+      // Claim known thread ids before awaiting app-server. This prevents another
+      // client's close handler from unsubscribing a concurrently resumed thread.
+      const provisionalThreadIds = buildProvisionalSubscriptionThreadIds(message.method, message.params ?? {});
+      const addedProvisionalThreadIds = new Set();
+      for (const threadId of provisionalThreadIds) {
+        if (addThreadOwner(socket, threadId)) {
+          addedProvisionalThreadIds.add(threadId);
+        }
+      }
+      activeRequestSocket = socket;
+
+      try {
+        const result =
+          message.method === "thread/unsubscribe"
+            ? await handleThreadUnsubscribe(socket, message.params ?? {})
+            : await appClient.request(message.method, message.params ?? {});
+        trackSubscriptionResults(socket, message.method, result);
+        send(socket, { id: message.id, result });
+        if (isStreaming && !socket.destroyed && sockets.has(socket)) {
+          activeStreamSocket = socket;
+          activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+        }
+        if (activeRequestSocket === socket) {
+          activeRequestSocket = null;
+        }
+      } catch (error) {
+        await releaseThreadOwners(socket, addedProvisionalThreadIds);
+        send(socket, {
+          id: message.id,
+          error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
+        });
+        if (activeRequestSocket === socket) {
+          activeRequestSocket = null;
+        }
+        if (activeStreamSocket === socket && !isStreaming) {
+          activeStreamSocket = null;
+        }
+      }
+    }
+
+    socket.on("data", (chunk) => {
       buffer += chunk;
       let newlineIndex = buffer.indexOf("\n");
       while (newlineIndex !== -1) {
         const line = buffer.slice(0, newlineIndex);
         buffer = buffer.slice(newlineIndex + 1);
         newlineIndex = buffer.indexOf("\n");
-
-        if (!line.trim()) {
-          continue;
-        }
-
-        let message;
-        try {
-          message = JSON.parse(line);
-        } catch (error) {
-          send(socket, {
-            id: null,
-            error: buildJsonRpcError(-32700, `Invalid JSON: ${error.message}`)
-          });
-          continue;
-        }
-
-        if (message.id !== undefined && message.method === "initialize") {
-          send(socket, {
-            id: message.id,
-            result: {
-              userAgent: "codex-companion-broker"
-            }
-          });
-          continue;
-        }
-
-        if (message.method === "initialized" && message.id === undefined) {
-          continue;
-        }
-
-        if (message.id !== undefined && message.method === "broker/shutdown") {
-          send(socket, { id: message.id, result: {} });
-          await shutdown(server);
-          process.exit(0);
-        }
-
-        if (message.id === undefined) {
-          continue;
-        }
-
-        const allowInterruptDuringActiveStream =
-          isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
-
-        if (
-          ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
-          !allowInterruptDuringActiveStream
-        ) {
-          send(socket, {
-            id: message.id,
-            error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Shared Codex broker is busy.")
-          });
-          continue;
-        }
-
-        if (allowInterruptDuringActiveStream) {
-          try {
-            const result = await appClient.request(message.method, message.params ?? {});
-            send(socket, { id: message.id, result });
-          } catch (error) {
-            send(socket, {
-              id: message.id,
-              error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
-            });
-          }
-          continue;
-        }
-
-        const isStreaming = STREAMING_METHODS.has(message.method);
-        // Claim known thread ids before awaiting app-server. This prevents another
-        // client's close handler from unsubscribing a concurrently resumed thread.
-        const provisionalThreadIds = buildProvisionalSubscriptionThreadIds(message.method, message.params ?? {});
-        const addedProvisionalThreadIds = new Set();
-        for (const threadId of provisionalThreadIds) {
-          if (addThreadOwner(socket, threadId)) {
-            addedProvisionalThreadIds.add(threadId);
-          }
-        }
-        activeRequestSocket = socket;
-
-        try {
-          const result =
-            message.method === "thread/unsubscribe"
-              ? await handleThreadUnsubscribe(socket, message.params ?? {})
-              : await appClient.request(message.method, message.params ?? {});
-          trackSubscriptionResults(socket, message.method, result, provisionalThreadIds);
-          send(socket, { id: message.id, result });
-          if (isStreaming) {
-            activeStreamSocket = socket;
-            activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
-          }
-          if (activeRequestSocket === socket) {
-            activeRequestSocket = null;
-          }
-        } catch (error) {
-          await releaseThreadOwners(socket, addedProvisionalThreadIds);
-          send(socket, {
-            id: message.id,
-            error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
-          });
-          if (activeRequestSocket === socket) {
-            activeRequestSocket = null;
-          }
-          if (activeStreamSocket === socket && !isStreaming) {
-            activeStreamSocket = null;
-          }
-        }
+        processing = processing.then(() => handleLine(line)).catch((error) => {
+          process.stderr.write(
+            `Failed to process broker request: ${error instanceof Error ? error.message : String(error)}\n`
+          );
+        });
       }
     });
 
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
-      socketUnsubscribingThreadIds.delete(socket);
       void releaseThreadOwners(socket);
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
-      socketUnsubscribingThreadIds.delete(socket);
       void releaseThreadOwners(socket);
     });
   });
