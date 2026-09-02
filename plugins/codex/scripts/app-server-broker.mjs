@@ -191,7 +191,13 @@ async function main() {
     const previous = pendingUnsubscribes.get(threadId);
     const execute = async () => {
       if (previous) {
-        await settleWithin(previous, UNSUBSCRIBE_WAIT_TIMEOUT_MS);
+        // Wait without a bound. The pending entry must not settle while any
+        // earlier upstream unsubscribe for this thread is still outstanding,
+        // otherwise a retried claim could slip past a hung cleanup request.
+        await previous.then(
+          () => {},
+          () => {}
+        );
       }
       if (threadSockets.has(threadId)) {
         return { result: null, error: null, skipped: true };

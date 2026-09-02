@@ -650,3 +650,41 @@ test("broker fails a resume when an in-flight unsubscribe outlives the bounded w
   await thirdClient.end();
   await secondClient.end();
 });
+
+test("broker keeps rejecting claims until a hung unsubscribe settles", async (t) => {
+  const broker = startBroker("resume-fails-unsubscribe-hangs");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  const firstClient = await connectClient(broker.socketPath);
+  const threadId = (await firstClient.request("thread/start", { cwd: process.cwd(), ephemeral: false })).thread.id;
+  await firstClient.end();
+  const unsubscribeStarted = await waitFor(() =>
+    readState(broker.statePath)?.unsubscribeRequests?.includes(threadId)
+  );
+  assert.equal(unsubscribeStarted, true, "unsubscribe request was not observed");
+
+  const attempt = async () => {
+    const client = await connectClient(broker.socketPath);
+    const outcome = await waitWithTimeout(
+      client.request("thread/resume", { threadId }).then(
+        () => ({ status: "fulfilled" }),
+        (error) => ({ status: "rejected", error })
+      ),
+      8000
+    );
+    await client.end();
+    return outcome;
+  };
+
+  // The first claim times out on the hung unsubscribe. Its release installs a
+  // follow-up cleanup that must stay pending; a retry must still be rejected.
+  const first = await attempt();
+  assert.equal(first?.status, "rejected");
+  assert.match(first.error.message, /still being released upstream/);
+  const retry = await attempt();
+  assert.equal(retry?.status, "rejected", "a retry slipped past the still-outstanding unsubscribe");
+  assert.match(retry.error.message, /still being released upstream/);
+  assert.deepEqual(readState(broker.statePath).requestOrder, []);
+  assert.deepEqual(readState(broker.statePath).subscriptions, [threadId]);
+});

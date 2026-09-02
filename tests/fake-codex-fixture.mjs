@@ -364,7 +364,7 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
-        if (BEHAVIOR === "unsubscribe-delayed") {
+        if (BEHAVIOR === "unsubscribe-delayed" || BEHAVIOR === "resume-fails-unsubscribe-hangs") {
           state.requestOrder = [...(state.requestOrder || []), "thread/resume"];
         }
         state.subscriptions = [...new Set([...(state.subscriptions || []), thread.id])];
