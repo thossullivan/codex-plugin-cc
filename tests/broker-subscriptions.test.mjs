@@ -688,3 +688,40 @@ test("broker keeps rejecting claims until a hung unsubscribe settles", async (t)
   assert.deepEqual(readState(broker.statePath).requestOrder, []);
   assert.deepEqual(readState(broker.statePath).subscriptions, [threadId]);
 });
+
+test("broker rejects an explicit unsubscribe that would queue behind a hung cleanup", async (t) => {
+  const broker = startBroker("resume-fails-unsubscribe-hangs");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  const firstClient = await connectClient(broker.socketPath);
+  const threadId = (await firstClient.request("thread/start", { cwd: process.cwd(), ephemeral: false })).thread.id;
+  await firstClient.end();
+  const unsubscribeStarted = await waitFor(() =>
+    readState(broker.statePath)?.unsubscribeRequests?.includes(threadId)
+  );
+  assert.equal(unsubscribeStarted, true, "unsubscribe request was not observed");
+
+  const secondClient = await connectClient(broker.socketPath);
+  const explicit = await waitWithTimeout(
+    secondClient.request("thread/unsubscribe", { threadId }).then(
+      () => ({ status: "fulfilled" }),
+      (error) => ({ status: "rejected", error })
+    ),
+    8000
+  );
+  assert.notEqual(explicit, null, "explicit unsubscribe never settled behind the hung cleanup");
+  assert.equal(explicit.status, "rejected");
+  assert.match(explicit.error.message, /still being released upstream/);
+
+  const thirdClient = await connectClient(broker.socketPath);
+  const thirdStarted = await waitWithTimeout(
+    thirdClient.request("thread/start", { cwd: process.cwd(), ephemeral: false }),
+    2000
+  );
+  assert.notEqual(thirdStarted, null, "broker remained busy after the rejected explicit unsubscribe");
+  // Only the original hung request reached upstream; nothing else was queued.
+  assert.deepEqual(readState(broker.statePath).unsubscribeRequests, [threadId]);
+  await thirdClient.end();
+  await secondClient.end();
+});

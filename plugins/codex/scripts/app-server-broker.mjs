@@ -185,16 +185,21 @@ async function main() {
   }
 
   function requestThreadUnsubscribe(threadId) {
-    // Never reuse an earlier request: the thread may have been reacquired and
-    // released again while that request was in flight. Chain behind it so the
-    // app-server sees one unsubscribe at a time, then re-check ownership.
+    // A request that has already been sent is never reused: the thread may have
+    // been reacquired and released again while it was in flight. A request that
+    // is still queued behind an earlier one re-checks ownership when it sends, so
+    // every release until then can share it instead of growing the chain.
     const previous = pendingUnsubscribes.get(threadId);
+    if (previous && !previous.sent) {
+      return previous.request;
+    }
+    const entry = { request: null, sent: false };
     const execute = async () => {
       if (previous) {
         // Wait without a bound. The pending entry must not settle while any
         // earlier upstream unsubscribe for this thread is still outstanding,
         // otherwise a retried claim could slip past a hung cleanup request.
-        await previous.then(
+        await previous.request.then(
           () => {},
           () => {}
         );
@@ -202,19 +207,19 @@ async function main() {
       if (threadSockets.has(threadId)) {
         return { result: null, error: null, skipped: true };
       }
+      entry.sent = true;
       const result = await appClient.request("thread/unsubscribe", { threadId });
       return { result, error: null };
     };
-    let request;
-    request = execute().then(
+    entry.request = execute().then(
       (outcome) => {
-        if (pendingUnsubscribes.get(threadId) === request) {
+        if (pendingUnsubscribes.get(threadId) === entry) {
           pendingUnsubscribes.delete(threadId);
         }
         return outcome;
       },
       (error) => {
-        if (pendingUnsubscribes.get(threadId) === request) {
+        if (pendingUnsubscribes.get(threadId) === entry) {
           pendingUnsubscribes.delete(threadId);
         }
         process.stderr.write(
@@ -223,8 +228,8 @@ async function main() {
         return { result: null, error };
       }
     );
-    pendingUnsubscribes.set(threadId, request);
-    return request;
+    pendingUnsubscribes.set(threadId, entry);
+    return entry.request;
   }
 
   function scheduleUnsubscribeRetry(threadId, retryIndex) {
@@ -290,6 +295,11 @@ async function main() {
       );
       if (sourceOwners.length === 0) {
         void unsubscribeIfUnowned(subscribedThreadId, { retryOnFailure: true });
+        continue;
+      }
+      if (pendingUnsubscribes.has(subscribedThreadId)) {
+        // A cleanup request for this child is still outstanding, so its upstream
+        // subscription is going away. Do not hand it to new owners.
         continue;
       }
       for (const socket of sourceOwners) {
@@ -465,13 +475,19 @@ async function main() {
       }
       activeRequestSocket = socket;
       // Let an in-flight unsubscribe for the same thread settle first so it cannot
-      // overtake the new subscription. The wait is bounded: a hung cleanup request
-      // must not block this client or keep the broker busy for everyone else. If
-      // it expires, fail the request instead of racing the outstanding unsubscribe.
+      // overtake the new subscription, and so an explicit unsubscribe does not
+      // queue behind it while this socket holds the busy slot. The wait is
+      // bounded: a hung cleanup request must not block this client or keep the
+      // broker busy for everyone else. If it expires, fail the request instead of
+      // racing or waiting on the outstanding unsubscribe.
+      const gatedThreadIds = new Set(provisionalThreadIds);
+      if (message.method === "thread/unsubscribe" && typeof message.params?.threadId === "string") {
+        gatedThreadIds.add(message.params.threadId);
+      }
       const settled = await Promise.all(
-        [...provisionalThreadIds].map((threadId) => {
+        [...gatedThreadIds].map((threadId) => {
           const pending = pendingUnsubscribes.get(threadId);
-          return pending ? settleWithin(pending, UNSUBSCRIBE_WAIT_TIMEOUT_MS) : true;
+          return pending ? settleWithin(pending.request, UNSUBSCRIBE_WAIT_TIMEOUT_MS) : true;
         })
       );
       if (settled.includes(false)) {
