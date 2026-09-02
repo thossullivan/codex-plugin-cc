@@ -19,7 +19,7 @@ const readline = require("node:readline");
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
-	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], subscriptions: [], unsubscribeRequests: [], capabilities: null, lastInterrupt: null };
+	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], subscriptions: [], unsubscribeRequests: [], requestOrder: [], capabilities: null, lastInterrupt: null };
 	  }
 	  return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
 	}
@@ -347,6 +347,12 @@ rl.on("line", (line) => {
       }
 
       case "thread/resume": {
+        if (BEHAVIOR === "resume-fails-unsubscribe-hangs" && message.params.persistFullHistory === true) {
+          setTimeout(() => {
+            send({ id: message.id, error: { code: -32000, message: "forced resume failure" } });
+          }, 50);
+          break;
+        }
         if (BEHAVIOR === "overlapping-resume" && message.params.persistFullHistory === true) {
           setTimeout(() => {
             send({ id: message.id, error: { code: -32000, message: "forced delayed resume failure" } });
@@ -358,6 +364,9 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        if (BEHAVIOR === "unsubscribe-delayed") {
+          state.requestOrder = [...(state.requestOrder || []), "thread/resume"];
+        }
         state.subscriptions = [...new Set([...(state.subscriptions || []), thread.id])];
         saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
@@ -379,12 +388,30 @@ rl.on("line", (line) => {
         const wasSubscribed = subscriptions.includes(message.params.threadId);
         const wasLoaded = state.threads.some((thread) => thread.id === message.params.threadId);
         state.unsubscribeRequests = [...(state.unsubscribeRequests || []), message.params.threadId];
+        if (BEHAVIOR === "resume-fails-unsubscribe-hangs") {
+          saveState(state);
+          break;
+        }
         if (
           BEHAVIOR === "unsubscribe-fails" ||
           (BEHAVIOR === "unsubscribe-fails-once" && state.unsubscribeRequests.length === 1)
         ) {
           saveState(state);
           send({ id: message.id, error: { code: -32000, message: "thread unsubscribe failed" } });
+          break;
+        }
+        if (BEHAVIOR === "unsubscribe-delayed") {
+          state.subscriptions = subscriptions.filter((threadId) => threadId !== message.params.threadId);
+          saveState(state);
+          setTimeout(() => {
+            const delayedState = loadState();
+            delayedState.requestOrder = [...(delayedState.requestOrder || []), "unsubscribe:response"];
+            saveState(delayedState);
+            send({
+              id: message.id,
+              result: { status: wasSubscribed ? "unsubscribed" : wasLoaded ? "notSubscribed" : "notLoaded" }
+            });
+          }, 300);
           break;
         }
         if (BEHAVIOR === "unsubscribe-notifies") {

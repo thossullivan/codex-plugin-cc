@@ -250,6 +250,53 @@ test("broker keeps a resumed thread subscribed until its final client closes", a
   await waitForUnsubscribes(broker.statePath, [threadId]);
 });
 
+test("broker serializes a resume behind an in-flight unsubscribe", async (t) => {
+  const broker = startBroker("unsubscribe-delayed");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  const firstClient = await connectClient(broker.socketPath);
+  const threadId = (await firstClient.request("thread/start", { cwd: process.cwd(), ephemeral: false })).thread.id;
+  await firstClient.end();
+  const unsubscribeStarted = await waitFor(() =>
+    readState(broker.statePath)?.unsubscribeRequests?.includes(threadId)
+  );
+  assert.equal(unsubscribeStarted, true, "unsubscribe request was not observed");
+
+  const secondClient = await connectClient(broker.socketPath);
+  await secondClient.request("thread/resume", { threadId });
+  assert.deepEqual(readState(broker.statePath).requestOrder, ["unsubscribe:response", "thread/resume"]);
+  assert.deepEqual(readState(broker.statePath).subscriptions, [threadId]);
+
+  await secondClient.end();
+  await waitForUnsubscribes(broker.statePath, [threadId, threadId]);
+  assert.deepEqual(readState(broker.statePath).subscriptions, []);
+});
+
+test("broker cancels a retry when a client reacquires the thread", async (t) => {
+  const broker = startBroker("unsubscribe-fails-once");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  const firstClient = await connectClient(broker.socketPath);
+  const threadId = (await firstClient.request("thread/start", { cwd: process.cwd(), ephemeral: false })).thread.id;
+  await firstClient.end();
+  const firstAttemptObserved = await waitFor(
+    () => readState(broker.statePath)?.unsubscribeRequests?.length === 1
+  );
+  assert.equal(firstAttemptObserved, true, "initial unsubscribe request was not observed");
+
+  const secondClient = await connectClient(broker.socketPath);
+  await secondClient.request("thread/resume", { threadId });
+  await delay(3000);
+  assert.deepEqual(readState(broker.statePath).subscriptions, [threadId]);
+
+  await secondClient.end();
+  const unsubscribed = await waitFor(() => readState(broker.statePath)?.subscriptions?.length === 0);
+  assert.equal(unsubscribed, true, "reacquired thread was not unsubscribed after its final owner closed");
+  assert.equal(readState(broker.statePath).unsubscribeRequests.at(-1), threadId);
+});
+
 test("broker unsubscribes source and detached review threads", async (t) => {
   const broker = startBroker();
   t.after(() => broker.stop());
@@ -448,6 +495,40 @@ test("broker serializes subscription requests from one downstream client", async
   await waitForUnsubscribes(broker.statePath, [threadId]);
 });
 
+test("broker replies to a failed resume even when the upstream unsubscribe hangs", async (t) => {
+  const broker = startBroker("resume-fails-unsubscribe-hangs");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  // Nobody owns this thread, so the failed provisional claim releases it upstream.
+  const threadId = "thr_unowned";
+  const firstClient = await connectClient(broker.socketPath);
+  const failedResume = await waitWithTimeout(
+    firstClient.request("thread/resume", { threadId, persistFullHistory: true }).then(
+      () => ({ status: "fulfilled" }),
+      (error) => ({ status: "rejected", error })
+    ),
+    2000
+  );
+  assert.notEqual(failedResume, null, "failed resume did not receive a response");
+  assert.equal(failedResume.status, "rejected");
+  assert.match(failedResume.error.message, /forced resume failure/);
+
+  const secondClient = await connectClient(broker.socketPath);
+  const secondStarted = await waitWithTimeout(
+    secondClient.request("thread/start", { cwd: process.cwd(), ephemeral: false }),
+    2000
+  );
+  assert.notEqual(secondStarted, null, "broker remained busy after the failed resume");
+
+  const unsubscribeStarted = await waitFor(() =>
+    readState(broker.statePath)?.unsubscribeRequests?.includes(threadId)
+  );
+  assert.equal(unsubscribeStarted, true, "the released thread was not unsubscribed upstream");
+  await secondClient.end();
+  await firstClient.end();
+});
+
 test("broker keeps shared upstream subscriptions when one client explicitly unsubscribes", async (t) => {
   const broker = startBroker();
   t.after(() => broker.stop());
@@ -503,6 +584,13 @@ test("broker logs upstream unsubscribe failures", async (t) => {
     () => broker.stderr().includes(`Failed to unsubscribe Codex thread ${threadId}: thread unsubscribe failed`)
   );
   assert.equal(warningObserved, true, "unsubscribe failure was not logged");
+  const retryBoundReached = await waitFor(
+    () => readState(broker.statePath)?.unsubscribeRequests?.length === 4,
+    { timeoutMs: 6000 }
+  );
+  assert.equal(retryBoundReached, true, "unsubscribe retries did not reach the expected bound");
+  await delay(500);
+  assert.equal(readState(broker.statePath).unsubscribeRequests.length, 4);
   assert.deepEqual(readState(broker.statePath).subscriptions, [threadId]);
 });
 
@@ -522,4 +610,34 @@ test("broker retries a transient upstream unsubscribe failure", async (t) => {
   assert.equal(retried, true, "the failed unsubscribe was not retried");
   assert.deepEqual(readState(broker.statePath).unsubscribeRequests, [threadId, threadId]);
   assert.match(broker.stderr(), new RegExp(`Failed to unsubscribe Codex thread ${threadId}`));
+});
+
+test("broker bounds the wait for a hung unsubscribe before a resume proceeds", async (t) => {
+  const broker = startBroker("resume-fails-unsubscribe-hangs");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  const firstClient = await connectClient(broker.socketPath);
+  const threadId = (await firstClient.request("thread/start", { cwd: process.cwd(), ephemeral: false })).thread.id;
+  await firstClient.end();
+  const unsubscribeStarted = await waitFor(() =>
+    readState(broker.statePath)?.unsubscribeRequests?.includes(threadId)
+  );
+  assert.equal(unsubscribeStarted, true, "unsubscribe request was not observed");
+
+  const secondClient = await connectClient(broker.socketPath);
+  const startedAt = Date.now();
+  const resumed = await waitWithTimeout(secondClient.request("thread/resume", { threadId }), 8000);
+  assert.notEqual(resumed, null, "resume never completed while the upstream unsubscribe hung");
+  assert.ok(Date.now() - startedAt >= 4000, "resume did not wait for the in-flight unsubscribe");
+  assert.deepEqual(readState(broker.statePath).subscriptions, [threadId]);
+
+  const thirdClient = await connectClient(broker.socketPath);
+  const thirdStarted = await waitWithTimeout(
+    thirdClient.request("thread/start", { cwd: process.cwd(), ephemeral: false }),
+    2000
+  );
+  assert.notEqual(thirdStarted, null, "broker remained busy after the bounded wait");
+  await thirdClient.end();
+  await secondClient.end();
 });

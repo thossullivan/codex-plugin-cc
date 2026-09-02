@@ -12,6 +12,23 @@ import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 const SUBSCRIBING_METHODS = new Set(["thread/start", "thread/resume", "thread/fork"]);
 const UNSUBSCRIBE_RETRY_DELAYS_MS = [100, 500, 2000];
+// Upper bound on how long a request waits for an in-flight thread/unsubscribe of
+// the same thread. A hung cleanup request must not wedge the shared broker.
+const UNSUBSCRIBE_WAIT_TIMEOUT_MS = 5000;
+
+function settleWithin(promise, timeoutMs) {
+  let timer;
+  return Promise.race([
+    promise.then(
+      () => {},
+      () => {}
+    ),
+    new Promise((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+      timer.unref?.();
+    })
+  ]).finally(() => clearTimeout(timer));
+}
 
 function buildSubscriptionThreadIds(method, result) {
   const threadIds = new Set();
@@ -167,13 +184,32 @@ async function main() {
   }
 
   function requestThreadUnsubscribe(threadId) {
-    const pending = pendingUnsubscribes.get(threadId);
-    if (pending) {
-      return pending;
-    }
-    const request = appClient.request("thread/unsubscribe", { threadId }).then(
-      (result) => ({ result, error: null }),
+    // Never reuse an earlier request: the thread may have been reacquired and
+    // released again while that request was in flight. Chain behind it so the
+    // app-server sees one unsubscribe at a time, then re-check ownership.
+    const previous = pendingUnsubscribes.get(threadId);
+    const execute = async () => {
+      if (previous) {
+        await settleWithin(previous, UNSUBSCRIBE_WAIT_TIMEOUT_MS);
+      }
+      if (threadSockets.has(threadId)) {
+        return { result: null, error: null, skipped: true };
+      }
+      const result = await appClient.request("thread/unsubscribe", { threadId });
+      return { result, error: null };
+    };
+    let request;
+    request = execute().then(
+      (outcome) => {
+        if (pendingUnsubscribes.get(threadId) === request) {
+          pendingUnsubscribes.delete(threadId);
+        }
+        return outcome;
+      },
       (error) => {
+        if (pendingUnsubscribes.get(threadId) === request) {
+          pendingUnsubscribes.delete(threadId);
+        }
         process.stderr.write(
           `Failed to unsubscribe Codex thread ${threadId}: ${error instanceof Error ? error.message : String(error)}\n`
         );
@@ -181,11 +217,6 @@ async function main() {
       }
     );
     pendingUnsubscribes.set(threadId, request);
-    void request.finally(() => {
-      if (pendingUnsubscribes.get(threadId) === request) {
-        pendingUnsubscribes.delete(threadId);
-      }
-    });
     return request;
   }
 
@@ -426,6 +457,15 @@ async function main() {
         }
       }
       activeRequestSocket = socket;
+      // Let an in-flight unsubscribe for the same thread settle first so it cannot
+      // overtake the new subscription. The wait is bounded: a hung cleanup request
+      // must not block this client or keep the broker busy for everyone else.
+      await Promise.all(
+        [...provisionalThreadIds].map((threadId) => {
+          const pending = pendingUnsubscribes.get(threadId);
+          return pending ? settleWithin(pending, UNSUBSCRIBE_WAIT_TIMEOUT_MS) : null;
+        })
+      );
 
       try {
         const result =
@@ -442,7 +482,6 @@ async function main() {
           activeRequestSocket = null;
         }
       } catch (error) {
-        await releaseThreadOwners(socket, addedProvisionalThreadIds);
         send(socket, {
           id: message.id,
           error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
@@ -453,6 +492,9 @@ async function main() {
         if (activeStreamSocket === socket && !isStreaming) {
           activeStreamSocket = null;
         }
+        // Release after replying: a hung upstream unsubscribe must not withhold
+        // the error or leave the broker busy for other clients.
+        void releaseThreadOwners(socket, addedProvisionalThreadIds);
       }
     }
 
