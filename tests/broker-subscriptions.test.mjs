@@ -612,7 +612,7 @@ test("broker retries a transient upstream unsubscribe failure", async (t) => {
   assert.match(broker.stderr(), new RegExp(`Failed to unsubscribe Codex thread ${threadId}`));
 });
 
-test("broker bounds the wait for a hung unsubscribe before a resume proceeds", async (t) => {
+test("broker fails a resume when an in-flight unsubscribe outlives the bounded wait", async (t) => {
   const broker = startBroker("resume-fails-unsubscribe-hangs");
   t.after(() => broker.stop());
   assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
@@ -627,9 +627,18 @@ test("broker bounds the wait for a hung unsubscribe before a resume proceeds", a
 
   const secondClient = await connectClient(broker.socketPath);
   const startedAt = Date.now();
-  const resumed = await waitWithTimeout(secondClient.request("thread/resume", { threadId }), 8000);
-  assert.notEqual(resumed, null, "resume never completed while the upstream unsubscribe hung");
+  const resumed = await waitWithTimeout(
+    secondClient.request("thread/resume", { threadId }).then(
+      () => ({ status: "fulfilled" }),
+      (error) => ({ status: "rejected", error })
+    ),
+    8000
+  );
+  assert.notEqual(resumed, null, "resume never settled while the upstream unsubscribe hung");
+  assert.equal(resumed.status, "rejected");
+  assert.match(resumed.error.message, /still being released upstream/);
   assert.ok(Date.now() - startedAt >= 4000, "resume did not wait for the in-flight unsubscribe");
+  // The resume was never sent upstream, so the fake still lists only the original subscription.
   assert.deepEqual(readState(broker.statePath).subscriptions, [threadId]);
 
   const thirdClient = await connectClient(broker.socketPath);

@@ -16,15 +16,16 @@ const UNSUBSCRIBE_RETRY_DELAYS_MS = [100, 500, 2000];
 // the same thread. A hung cleanup request must not wedge the shared broker.
 const UNSUBSCRIBE_WAIT_TIMEOUT_MS = 5000;
 
+// Resolves true once the promise settles, or false if the timeout expires first.
 function settleWithin(promise, timeoutMs) {
   let timer;
   return Promise.race([
     promise.then(
-      () => {},
-      () => {}
+      () => true,
+      () => true
     ),
     new Promise((resolve) => {
-      timer = setTimeout(resolve, timeoutMs);
+      timer = setTimeout(() => resolve(false), timeoutMs);
       timer.unref?.();
     })
   ]).finally(() => clearTimeout(timer));
@@ -459,13 +460,28 @@ async function main() {
       activeRequestSocket = socket;
       // Let an in-flight unsubscribe for the same thread settle first so it cannot
       // overtake the new subscription. The wait is bounded: a hung cleanup request
-      // must not block this client or keep the broker busy for everyone else.
-      await Promise.all(
+      // must not block this client or keep the broker busy for everyone else. If
+      // it expires, fail the request instead of racing the outstanding unsubscribe.
+      const settled = await Promise.all(
         [...provisionalThreadIds].map((threadId) => {
           const pending = pendingUnsubscribes.get(threadId);
-          return pending ? settleWithin(pending, UNSUBSCRIBE_WAIT_TIMEOUT_MS) : null;
+          return pending ? settleWithin(pending, UNSUBSCRIBE_WAIT_TIMEOUT_MS) : true;
         })
       );
+      if (settled.includes(false)) {
+        send(socket, {
+          id: message.id,
+          error: buildJsonRpcError(
+            -32000,
+            "Codex thread is still being released upstream; retry the request shortly."
+          )
+        });
+        if (activeRequestSocket === socket) {
+          activeRequestSocket = null;
+        }
+        void releaseThreadOwners(socket, addedProvisionalThreadIds);
+        return;
+      }
 
       try {
         const result =
