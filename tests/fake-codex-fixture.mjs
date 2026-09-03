@@ -348,6 +348,8 @@ rl.on("line", (line) => {
 
       case "thread/resume": {
         if (BEHAVIOR === "with-delayed-subagent" && message.params.persistFullHistory === true) {
+          state.nestedSubagentRequested = true;
+          saveState(state);
           setTimeout(() => {
             send({ id: message.id, error: { code: -32000, message: "forced resume failure after child arrival" } });
           }, 250);
@@ -556,6 +558,17 @@ rl.on("line", (line) => {
             send({ method: "thread/started", params: { thread: { ...buildThread(subThreadRecord), name: subThreadRecord.name, agentNickname: subThreadRecord.name } } });
             send({ method: "turn/started", params: { threadId: subThread.id, turn: buildTurn(subTurnId) } });
             send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } });
+            if (delayedState.nestedSubagentRequested) {
+              setTimeout(() => {
+                const nestedState = loadState();
+                const grandchild = nextThread(nestedState, thread.cwd, true, { parentThreadId: subThread.id });
+                const grandchildRecord = ensureThread(nestedState, grandchild.id);
+                grandchildRecord.name = "delayed-design-grandchild";
+                nestedState.subscriptions = [...new Set([...(nestedState.subscriptions || []), grandchild.id])];
+                saveState(nestedState);
+                send({ method: "thread/started", params: { thread: { ...buildThread(grandchildRecord), name: grandchildRecord.name, agentNickname: grandchildRecord.name } } });
+              }, 100);
+            }
           }, 100);
           break;
         }

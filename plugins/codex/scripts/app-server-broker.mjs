@@ -308,9 +308,10 @@ async function main() {
       for (const socket of sourceOwners) {
         if (addThreadOwner(socket, subscribedThreadId)) {
           // Ownership inherited through a claim that has not succeeded yet is
-          // rolled back with that claim.
+          // rolled back with that claim. The source may itself be an inherited
+          // child, so nested descendants are recorded too.
           const claim = provisionalClaims.get(socket);
-          if (claim?.threadIds.has(sourceThreadId)) {
+          if (claim && (claim.threadIds.has(sourceThreadId) || claim.inheritedThreadIds.has(sourceThreadId))) {
             claim.inheritedThreadIds.add(subscribedThreadId);
           }
         }

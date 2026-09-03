@@ -751,9 +751,17 @@ test("broker rolls back child threads inherited through a failed provisional cla
     (thread) => thread.name === "delayed-design-challenger"
   );
   assert.ok(childThread, "delayed child thread was not created");
+  const grandchildCreated = await waitFor(() =>
+    readState(broker.statePath)?.threads.some((thread) => thread.name === "delayed-design-grandchild")
+  );
+  assert.equal(grandchildCreated, true, "delayed grandchild thread was not created");
+  const grandchildThread = readState(broker.statePath).threads.find(
+    (thread) => thread.name === "delayed-design-grandchild"
+  );
 
-  // Both the parent and the inherited child are released while the client stays connected.
-  await waitForUnsubscribes(broker.statePath, [threadId, threadId, childThread.id]);
+  // The parent, the inherited child, and the nested grandchild are all released
+  // while the client stays connected.
+  await waitForUnsubscribes(broker.statePath, [threadId, threadId, childThread.id, grandchildThread.id]);
   assert.deepEqual(readState(broker.statePath).subscriptions, []);
   await secondClient.end();
 });
