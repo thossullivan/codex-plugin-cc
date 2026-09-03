@@ -136,6 +136,9 @@ async function main() {
   const threadSockets = new Map();
   const pendingUnsubscribes = new Map();
   const unsubscribeRetryTimers = new Map();
+  // Threads a socket claimed for a request that has not succeeded yet, plus any
+  // child threads it inherited through those claims while the request was open.
+  const provisionalClaims = new Map();
 
   function cancelUnsubscribeRetry(threadId) {
     const retry = unsubscribeRetryTimers.get(threadId);
@@ -303,7 +306,14 @@ async function main() {
         continue;
       }
       for (const socket of sourceOwners) {
-        addThreadOwner(socket, subscribedThreadId);
+        if (addThreadOwner(socket, subscribedThreadId)) {
+          // Ownership inherited through a claim that has not succeeded yet is
+          // rolled back with that claim.
+          const claim = provisionalClaims.get(socket);
+          if (claim?.threadIds.has(sourceThreadId)) {
+            claim.inheritedThreadIds.add(subscribedThreadId);
+          }
+        }
       }
     }
   }
@@ -473,6 +483,16 @@ async function main() {
           addedProvisionalThreadIds.add(threadId);
         }
       }
+      const claim = { threadIds: addedProvisionalThreadIds, inheritedThreadIds: new Set() };
+      if (addedProvisionalThreadIds.size > 0) {
+        provisionalClaims.set(socket, claim);
+      }
+      const rollBackClaim = () => {
+        if (provisionalClaims.get(socket) === claim) {
+          provisionalClaims.delete(socket);
+        }
+        void releaseThreadOwners(socket, new Set([...claim.threadIds, ...claim.inheritedThreadIds]));
+      };
       activeRequestSocket = socket;
       // Let an in-flight unsubscribe for the same thread settle first so it cannot
       // overtake the new subscription, and so an explicit unsubscribe does not
@@ -501,7 +521,7 @@ async function main() {
         if (activeRequestSocket === socket) {
           activeRequestSocket = null;
         }
-        void releaseThreadOwners(socket, addedProvisionalThreadIds);
+        rollBackClaim();
         return;
       }
 
@@ -511,6 +531,9 @@ async function main() {
             ? await handleThreadUnsubscribe(socket, message.params ?? {})
             : await appClient.request(message.method, message.params ?? {});
         trackSubscriptionResults(socket, message.method, result);
+        if (provisionalClaims.get(socket) === claim) {
+          provisionalClaims.delete(socket);
+        }
         send(socket, { id: message.id, result });
         if (isStreaming && !socket.destroyed && sockets.has(socket)) {
           activeStreamSocket = socket;
@@ -532,7 +555,7 @@ async function main() {
         }
         // Release after replying: a hung upstream unsubscribe must not withhold
         // the error or leave the broker busy for other clients.
-        void releaseThreadOwners(socket, addedProvisionalThreadIds);
+        rollBackClaim();
       }
     }
 

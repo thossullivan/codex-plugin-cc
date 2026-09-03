@@ -725,3 +725,35 @@ test("broker rejects an explicit unsubscribe that would queue behind a hung clea
   await thirdClient.end();
   await secondClient.end();
 });
+
+test("broker rolls back child threads inherited through a failed provisional claim", async (t) => {
+  const broker = startBroker("with-delayed-subagent");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  const firstClient = await connectClient(broker.socketPath);
+  const threadId = (await firstClient.request("thread/start", { cwd: process.cwd(), ephemeral: false })).thread.id;
+  await firstClient.request("turn/start", {
+    threadId,
+    input: [{ type: "text", text: "spawn a child while another client is resuming" }]
+  });
+  firstClient.destroy();
+  await waitForUnsubscribes(broker.statePath, [threadId]);
+
+  // The resume fails after 250 ms; the delayed child arrives at 100 ms while the
+  // claim is still open, so the claiming socket inherits it.
+  const secondClient = await connectClient(broker.socketPath);
+  await assert.rejects(
+    secondClient.request("thread/resume", { threadId, persistFullHistory: true }),
+    /forced resume failure after child arrival/
+  );
+  const childThread = readState(broker.statePath).threads.find(
+    (thread) => thread.name === "delayed-design-challenger"
+  );
+  assert.ok(childThread, "delayed child thread was not created");
+
+  // Both the parent and the inherited child are released while the client stays connected.
+  await waitForUnsubscribes(broker.statePath, [threadId, threadId, childThread.id]);
+  assert.deepEqual(readState(broker.statePath).subscriptions, []);
+  await secondClient.end();
+});

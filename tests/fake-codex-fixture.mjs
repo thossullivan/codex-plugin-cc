@@ -347,6 +347,12 @@ rl.on("line", (line) => {
       }
 
       case "thread/resume": {
+        if (BEHAVIOR === "with-delayed-subagent" && message.params.persistFullHistory === true) {
+          setTimeout(() => {
+            send({ id: message.id, error: { code: -32000, message: "forced resume failure after child arrival" } });
+          }, 250);
+          break;
+        }
         if (BEHAVIOR === "resume-fails-unsubscribe-hangs" && message.params.persistFullHistory === true) {
           setTimeout(() => {
             send({ id: message.id, error: { code: -32000, message: "forced resume failure" } });
