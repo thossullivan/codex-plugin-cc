@@ -346,6 +346,10 @@ async function main() {
     if (outcome?.error) {
       if (!socket.destroyed && sockets.has(socket)) {
         addThreadOwner(socket, threadId);
+      } else {
+        // The requester is gone, so nobody will retry on its behalf. Fall back
+        // to the automatic cleanup path for the now-unowned thread.
+        scheduleUnsubscribeRetry(threadId, 0);
       }
       throw outcome.error;
     }

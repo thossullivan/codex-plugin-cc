@@ -765,3 +765,20 @@ test("broker rolls back child threads inherited through a failed provisional cla
   assert.deepEqual(readState(broker.statePath).subscriptions, []);
   await secondClient.end();
 });
+
+test("broker retries cleanup when a client disconnects during a failing explicit unsubscribe", async (t) => {
+  const broker = startBroker("unsubscribe-fails-once-delayed");
+  t.after(() => broker.stop());
+  assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
+
+  const client = await connectClient(broker.socketPath);
+  const threadId = (await client.request("thread/start", { cwd: process.cwd(), ephemeral: false })).thread.id;
+  // Send the explicit unsubscribe and drop the socket before the upstream reply.
+  void client.request("thread/unsubscribe", { threadId }).catch(() => {});
+  await waitFor(() => readState(broker.statePath)?.unsubscribeRequests?.length === 1);
+  client.destroy();
+
+  // The first attempt fails 300 ms later, after the requester is gone; the broker must retry on its own.
+  await waitForUnsubscribes(broker.statePath, [threadId, threadId]);
+  assert.deepEqual(readState(broker.statePath).subscriptions, []);
+});

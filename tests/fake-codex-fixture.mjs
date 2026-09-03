@@ -25,7 +25,10 @@ const readline = require("node:readline");
 	}
 
 function saveState(state) {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  // Write atomically so a test reading the file never sees a partial document.
+  const tmpPath = STATE_PATH + ".tmp";
+  fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2));
+  fs.renameSync(tmpPath, STATE_PATH);
 }
 
 function requiresExperimental(field, message, state) {
@@ -398,6 +401,13 @@ rl.on("line", (line) => {
         state.unsubscribeRequests = [...(state.unsubscribeRequests || []), message.params.threadId];
         if (BEHAVIOR === "resume-fails-unsubscribe-hangs") {
           saveState(state);
+          break;
+        }
+        if (BEHAVIOR === "unsubscribe-fails-once-delayed" && state.unsubscribeRequests.length === 1) {
+          saveState(state);
+          setTimeout(() => {
+            send({ id: message.id, error: { code: -32000, message: "thread unsubscribe failed" } });
+          }, 300);
           break;
         }
         if (
